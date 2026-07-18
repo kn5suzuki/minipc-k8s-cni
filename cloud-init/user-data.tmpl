@@ -1,0 +1,73 @@
+#cloud-config
+merge_how:
+  - name: list
+    settings: [replace]
+  - name: dict
+    settings: [replace]
+hostname: __HOST__
+manage_etc_hosts: false
+write_files:
+  - path: /etc/hosts
+    content: |
+      127.0.0.1 localhost
+      127.0.1.1 __HOST__
+      192.168.100.11  control
+      192.168.100.12  worker1
+      192.168.100.13  worker2
+      ::1 localhost ip6-localhost ip6-loopback
+      ff02::1 ip6-allnodes
+      ff02::2 ip6-allrouters
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+  - path: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: ubuntu
+    ssh_authorized_keys:
+      - __SSHKEY__
+ssh_pwauth: true
+package_update: true
+package_upgrade: false
+packages:
+  - chrony
+  - python3
+  - net-tools
+  - curl
+  - wget
+  - apt-transport-https
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - jq
+  - tcpdump
+  - iproute2
+  - iputils-ping
+  - bridge-utils
+  - conntrack
+runcmd:
+  - timedatectl set-timezone Asia/Tokyo
+  - |
+    if [ "__HOST__" = "control" ]; then
+      sed -i '/^pool /d' /etc/chrony/chrony.conf
+      echo 'pool ntp.nict.jp iburst' >> /etc/chrony/chrony.conf
+      echo 'allow 192.168.100.0/24' >> /etc/chrony/chrony.conf
+    else
+      sed -i '/^pool /d' /etc/chrony/chrony.conf
+      echo 'server control iburst' >> /etc/chrony/chrony.conf
+    fi
+    systemctl restart chrony
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+  - swapoff -a
+  - sed -i '/\bswap\b/d' /etc/fstab
