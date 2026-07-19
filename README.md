@@ -48,18 +48,7 @@ Pod / Service CIDR (kubeadm で指定):
 次にどの章を読んでも影響を受けません。4 章は 1〜3 章の内容を横断的に比較する
 リファレンスです。
 
-## 3. 学習ゴール (JANOG57 スライド対応)
-
-| スライドの章              | 対応する手順                          |
-|--------------------------|---------------------------------------|
-| Kubernetes を知る         | Step 0: kubeadm でクラスタ構築       |
-| Kubernetes とネットワーク  | Step 0: Pod / Service の概念確認      |
-| Linux のネットワークスタック| Step 1〜3: veth / bridge / iptables 観察 |
-| L2/L3 ネットワーク: CNI   | Step 1 (Flannel), 2 (Calico), 3 (Cilium) |
-| L4 ロードバランサー        | Step 0〜3: kube-proxy / Cilium KP     |
-| プラットフォームとの対話    | Step 4: 比較まとめ                    |
-
-## 4. 前提と注意
+## 3. 前提と注意
 
 - **メモリ**: 4 + 3 + 3 = 10 GB を VM に割り当てます。ホスト残 6 GB。
   16 GB がきつい場合は control 3 GB / worker 各 2 GB に減らしても動作します。
@@ -69,21 +58,27 @@ Pod / Service CIDR (kubeadm で指定):
   章ごとに「その章の CNI をアンインストールして 0 章直後の状態に戻す」手順を
   末尾に記載しています。
 
-## 5. ディレクトリ構成
+## 4. ディレクトリ構成
 
 ```
 minipc-kubernetes/
-├── README.md
-├── 00-setup.md
-├── 01-flannel.md
-├── 02-calico.md
-├── 03-cilium.md
-├── 04-comparison.md
+├── README.md               # このファイル (概要・手順の入り口)
+├── CLAUDE.md                # Claude Code 向けのリポジトリ運用ルール
+├── Makefile                  # VM構築〜CNI切り替えまで全操作の起点 (make help で一覧)
+├── 00-setup.md               # 0章: ホスト準備 + make cluster でのクラスタ構築
+├── 01-flannel.md             # 1章: Flannel (VXLANオーバーレイ) を体験
+├── 02-calico.md              # 2章: Calico (BGP/IPIP) とネットワークポリシーを体験
+├── 03-cilium.md              # 3章: Cilium (eBPF) と Hubble可視化を体験
+├── 04-comparison.md          # 4章: 3 CNI の比較まとめ
 ├── net/
-│   └── k8s-mgmt-net.xml
+│   └── k8s-mgmt-net.xml     # libvirt 仮想ネットワーク定義 (virbr10, 192.168.100.0/24) — make nets が読む
 ├── cloud-init/
-│   ├── user-data.tmpl
-│   ├── network-config.tmpl
-│   └── make-seed.sh
-└── images/                    # cloud image / seed ISO 置き場
+│   ├── user-data.tmpl        # 全ノード共通の cloud-init テンプレート
+│   ├── network-config.tmpl   # ノードごとの固定IPアドレス設定テンプレート
+│   └── make-seed.sh          # 上記2つをレンダリングし seed ISO を作るスクリプト (make seeds が呼ぶ)
+├── scripts/
+│   └── k8s-prereq.sh         # 全ノードに containerd + kubeadm/kubelet/kubectl を導入 (make k8s-prereq が SSH 経由で実行、VM にはコピーしない)
+├── manifests/
+│   └── nginx-ds.yaml         # 01〜03章で使い回すテスト用ワークロード (nginx DaemonSet + ClusterIP Service + debug Pod)
+└── images/                   # cloud image / seed ISO の置き場 (make が生成。.gitignore 対象で Git 管理外)
 ```
