@@ -419,6 +419,36 @@ wait
 # veth 上では Pod IP 同士のパケットがカプセル化なしでそのまま見える
 ```
 
+### iperf3 でスループットを計測 (ベースライン)
+
+2.6 (IPIP) / 2.7 (BGP ネイティブ) のノードをまたぐ結果と比較するためのベースラインを、
+専用の `iperf3` サーバー/クライアント Pod で測っておく。manifest は
+`manifests/iperf3.yaml` (`iperf3-client`/`iperf3-server-w1` は worker1、
+`iperf3-server-w2` は worker2 に固定。03 章の Cilium でも同じ manifest を使い回す) を
+使う。3つとも一度に作っておき、`iperf3-server-w2` は 2.6/2.7 で使うまでそのまま起動
+待機させておく:
+
+```bash
+kubectl apply -f manifests/iperf3.yaml
+kubectl wait --for=condition=Ready pod/iperf3-client pod/iperf3-server-w1 pod/iperf3-server-w2
+```
+
+```bash
+IPERF_W1=$(kubectl get pod iperf3-server-w1 -o jsonpath='{.status.podIP}')
+kubectl exec iperf3-client -- iperf3 -c $IPERF_W1 -t 5
+# [ ID] Interval           Transfer     Bitrate         Retr
+# [  5]   0.00-5.00   sec  ... GBytes  ... Gbits/sec    0    sender
+# ★ 同一ノード内は上で確認した通り veth (cali...) への /32 ホストルート直結のみで、
+#   IPIP/BGP ネイティブどちらのモードでも経路は変わらないベースライン値
+```
+
+同一ノード用のサーバーはもう使わないので削除する (`iperf3-client` は 2.6/2.7 で
+使い回すため残しておく):
+
+```bash
+kubectl delete pod iperf3-server-w1
+```
+
 **まとめ**: 同一ノード内は Pod ごとの `/32` ホストルートによる直接ルーティングのみ。
 次の 2.6 で確認する「ノードをまたぐ通信」だけが IPIP トンネル (`tunl0`) や BGP
 ネイティブルーティングを必要とします。
@@ -500,6 +530,28 @@ kubectl exec -n calico-system $CALICO_POD -- birdcl show route
 (Bird) が担っています。IPIP はあくまでカプセル化の方式であり、ルート配布そのものは
 2.7 で見る BGP ネイティブモードと同じ Bird が行っています。
 
+### iperf3 でスループットを計測 (IPIP 経由)
+
+2.5 で `manifests/iperf3.yaml` と一緒に起動しておいた `iperf3-server-w2` (worker2) と
+`iperf3-client` (worker1) をそのまま使う。この `iperf3-server-w2` は 2.7 の BGP
+ネイティブルーティングとの比較にも再利用するため、ここでは削除せずに残しておく。
+
+```bash
+IPERF_W2=$(kubectl get pod iperf3-server-w2 -o jsonpath='{.status.podIP}')
+kubectl exec iperf3-client -- iperf3 -c $IPERF_W2 -t 5
+# [ ID] Interval           Transfer     Bitrate         Retr
+# [  5]   0.00-5.00   sec   ... MBytes  ... Mbits/sec    x    sender
+# IPIP のカプセル化/デカプセル化コスト (MTU 1480 への分割、CPU 処理) が乗った状態の値
+
+# 参考: RTT の平均もついでに見ておく (2.7 の値と比較する)
+# iperf3-client の networkstatic/iperf3 イメージには ping が入っていないため、
+# 同じ worker1 上にいる debug (busybox) から ping する
+kubectl exec debug -- ping -c 20 -q $IPERF_W2 | tail -3
+```
+
+この iperf3/ping の値は、次の 2.7 で BGP ネイティブルーティングに切り替えた後の
+値と比較する。
+
 ---
 
 ## 2.7 BGP モード (ネイティブルーティング) に切り替え
@@ -541,6 +593,73 @@ ssh ubuntu@worker1 "sudo tcpdump -i enp1s0 -n 'dst $NGINX_W2' -v -c5"
 
 **ポイント**: BGP ネイティブルーティングではカプセル化オーバーヘッドがゼロ。
 MTU 問題も発生しないためパフォーマンスが向上します。
+
+### iperf3 で再計測 (BGP ネイティブルーティング経由)
+
+2.6 で使った `iperf3-server-w2` / `iperf3-client` はそのまま残っているので、Pod を
+作り直さずにモード切り替えの影響だけを計測できる:
+
+```bash
+kubectl exec iperf3-client -- iperf3 -c $IPERF_W2 -t 5
+# [ ID] Interval           Transfer     Bitrate         Retr
+# [  5]   0.00-5.00   sec   ... MBytes  ... Mbits/sec    x    sender
+# IPIP のカプセル化/デカプセル化が無くなった状態の値。2.6 の結果と見比べる
+
+kubectl exec debug -- ping -c 20 -q $IPERF_W2 | tail -3
+# rtt min/avg/max/mdev = ... ms
+# 2.6 (IPIP) の平均 RTT と比較する
+```
+
+**ポイント**: このラボの物理 NIC は 1GbE のため、スループット自体は NIC がボトルネックに
+なり IPIP/BGP ネイティブの差が誤差程度に収まることもある。差が出やすいのはむしろ
+
+- **RTT** (IPIP はパケットごとにカプセル化/デカプセル化の処理が挟まる分だけ増える)
+- `iperf3` 出力の **Retr** (再送) 列 (MTU 1480 への分割で発生しやすい)
+- ノードの CPU 使用率 (`ssh ubuntu@worker1 mpstat 1 3` などでカプセル化処理のコストを見る)
+
+の3点。10GbE 以上の環境ではスループット自体の差もより顕著に出やすい (Cilium の
+VXLAN/ネイティブ比較 (03 章 3.7) も同じ傾向)。
+
+計測用 Pod を片付ける:
+
+```bash
+kubectl delete pod iperf3-client iperf3-server-w2 --ignore-not-found
+```
+
+### 参考: IPIP モードに戻す手順
+
+以降の章 (2.8〜2.13) はどちらのモードでも進められるため、切り戻しは必須ではない
+(2.13 のアンインストールは `tunl0` を無条件で削除するため、IPIP/BGP どちらの状態から
+実行しても同じ手順で完了する)。2.1 でインストールした IPIP の状態に戻したい場合は、
+`encapsulation` を `None` から `IPIP` に patch し直すだけでよい:
+
+```bash
+kubectl patch installation default --type merge -p '
+{
+  "spec": {
+    "calicoNetwork": {
+      "ipPools": [{
+        "name": "default-ipv4-ippool",
+        "cidr": "10.244.0.0/16",
+        "encapsulation": "IPIP",
+        "natOutgoing": "Enabled",
+        "nodeSelector": "all()"
+      }]
+    }
+  }
+}'
+```
+
+戻ったことを確認:
+
+```bash
+# 再び tunl0 経由になる
+ssh ubuntu@worker1 'ip route | grep tunl0'
+# 10.244.A.0/26 via 192.168.100.11 dev tunl0 proto bird
+# 10.244.B.0/26 via 192.168.100.13 dev tunl0 proto bird
+
+kubectl exec debug -- ping -c3 $NGINX_W2
+```
 
 ---
 

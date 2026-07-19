@@ -79,6 +79,7 @@ minipc-kubernetes/
 ├── scripts/
 │   └── k8s-prereq.sh         # 全ノードに containerd + kubeadm/kubelet/kubectl を導入 (make k8s-prereq が SSH 経由で実行、VM にはコピーしない)
 ├── manifests/
-│   └── nginx-ds.yaml         # 01〜03章で使い回すテスト用ワークロード (nginx DaemonSet + ClusterIP Service + debug Pod)
+│   ├── nginx-ds.yaml         # 01〜03章で使い回すテスト用ワークロード (nginx DaemonSet + ClusterIP Service + debug Pod)
+│   └── iperf3.yaml           # 02/03章のトンネル vs ネイティブルーティング性能比較で使い回す iperf3 client/server Pod
 └── images/                   # cloud image / seed ISO の置き場 (make が生成。.gitignore 対象で Git 管理外)
 ```

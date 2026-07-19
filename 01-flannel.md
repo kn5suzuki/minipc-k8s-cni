@@ -315,6 +315,35 @@ wait
 # cni0 上では Pod IP 同士のパケットがカプセル化なしでそのまま見える
 ```
 
+### iperf3 でスループットを計測 (ベースライン)
+
+1.6 のノードをまたぐ結果と比較するためのベースラインを、専用の `iperf3` サーバー/
+クライアント Pod で測っておく。manifest は `manifests/iperf3.yaml` (`iperf3-client`/
+`iperf3-server-w1` は worker1、`iperf3-server-w2` は worker2 に固定。02/03 章でも同じ
+manifest を使い回す) を使う。3つとも一度に作っておき、`iperf3-server-w2` は 1.6 で
+使うまでそのまま起動待機させておく:
+
+```bash
+kubectl apply -f manifests/iperf3.yaml
+kubectl wait --for=condition=Ready pod/iperf3-client pod/iperf3-server-w1 pod/iperf3-server-w2
+```
+
+```bash
+IPERF_W1=$(kubectl get pod iperf3-server-w1 -o jsonpath='{.status.podIP}')
+kubectl exec iperf3-client -- iperf3 -c $IPERF_W1 -t 5
+# [ ID] Interval           Transfer     Bitrate         Retr
+# [  5]   0.00-5.00   sec  ... GBytes  ... Gbits/sec    0    sender
+# ★ 同一ノード内は上で確認した通り cni0 (Linux Bridge) の L2 スイッチングのみで、
+#   物理 NIC も VXLAN も経由しないベースライン値
+```
+
+同一ノード用のサーバーはもう使わないので削除する (`iperf3-client` は 1.6 で
+使い回すため残しておく):
+
+```bash
+kubectl delete pod iperf3-server-w1
+```
+
 **まとめ**: 同一ノード内は `cni0` による通常の L2 ブリッジングのみ。
 次の 1.6 で確認する「ノードをまたぐ通信」だけが VXLAN カプセル化
 (`flannel.1`) を必要とします。
@@ -398,6 +427,36 @@ ssh ubuntu@worker1 'sudo tcpdump -r /tmp/flannel.pcap -n -v | head -20'
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # 外側: ノード IP (192.168.100.x) で VXLAN カプセル化
 # 内側: Pod IP (10.244.x.x) が元のパケット
+```
+
+### iperf3 でスループットを計測 (VXLAN 経由)
+
+1.5 で `manifests/iperf3.yaml` と一緒に起動しておいた `iperf3-server-w2` (worker2) と
+`iperf3-client` (worker1) をそのまま使う。
+
+```bash
+IPERF_W2=$(kubectl get pod iperf3-server-w2 -o jsonpath='{.status.podIP}')
+kubectl exec iperf3-client -- iperf3 -c $IPERF_W2 -t 5
+# [ ID] Interval           Transfer     Bitrate         Retr
+# [  5]   0.00-5.00   sec   ... MBytes  ... Mbits/sec    x    sender
+# VXLAN のカプセル化/デカプセル化コスト (MTU 1450 への分割、CPU 処理) が乗った状態の値
+
+# 参考: RTT の平均もついでに見ておく (1.5 のベースラインと比較する)
+# iperf3-client の networkstatic/iperf3 イメージには ping が入っていないため、
+# 同じ worker1 上にいる debug (busybox) から ping する
+kubectl exec debug -- ping -c 20 -q $IPERF_W2 | tail -3
+```
+
+**ポイント**: Flannel はこのラボでは VXLAN バックエンド固定 (`net-conf.json` の
+`Backend.Type: "vxlan"`、1.2 参照) のため、Calico (2.7) や Cilium (3.7) のような
+「トンネルなしモードへの切り替え」は選べない。VXLAN のオーバーヘッド (MTU 1450 への
+分割、カプセル化/デカプセル化の CPU コスト) は 1.5 のベースラインとの差として現れる。
+10GbE 以上の環境ではこの差がより顕著になりやすい。
+
+計測用 Pod を片付ける:
+
+```bash
+kubectl delete pod iperf3-client iperf3-server-w2 --ignore-not-found
 ```
 
 **まとめ**: 1.5 (同一ノード内) は `cni0` の L2 ブリッジングだけで完結し、物理 NIC には
