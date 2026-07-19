@@ -578,6 +578,12 @@ kubectl get ippools.crd.projectcalico.org -o yaml
 # テスト用リソースを先に削除 (Calico の IP を持ったまま残さない)
 kubectl delete -f manifests/nginx-ds.yaml --ignore-not-found
 
+# CoreDNS を一時的に 0 replica にする (CNI がまだ生きている今のうちに
+# Pod をきれいに削除させる。ReplicaSet による再作成も防げる)
+COREDNS_REPLICAS=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}')
+kubectl scale deployment coredns -n kube-system --replicas=0
+kubectl wait --for=delete pod -n kube-system -l k8s-app=kube-dns --timeout=60s
+
 kubectl delete -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/tigera-operator.yaml
 kubectl delete -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/custom-resources.yaml 2>/dev/null || true
 
@@ -600,20 +606,22 @@ for node in control worker1 worker2; do
   ssh ubuntu@$node 'sudo rm -f /etc/cni/net.d/10-calico.conflist /etc/cni/net.d/calico-kubeconfig'
 done
 
-# CoreDNS Pod を削除する (01章のアンインストール手順と同じ理由・同じタイミング)
-# CNI が存在しない状態で削除するので Pending のまま次章に進む
-kubectl delete pod -n kube-system -l k8s-app=kube-dns
+# CoreDNS を元の replica 数に戻す (01章と同じ理由・同じタイミング)
+# CNI が存在しない状態で新しい Pod が作られるので Pending のまま次章に進む
+kubectl scale deployment coredns -n kube-system --replicas=$COREDNS_REPLICAS
 
 # Node が NotReady になることを確認
 kubectl get nodes
 ```
 
 **⚠️ 重要**: [1.10](01-flannel.md#110-flannel-のアンインストール-cni-未導入の状態に戻す)
-と同じ理由で、CoreDNS Pod は Calico のインターフェース/CNI 設定を削除した
-**後**に削除しています。こうすることで CoreDNS は `Pending` のまま待機し、
-次にどの CNI (Flannel や Cilium) を導入した瞬間にも自動的にスケジュールされ、
-新しい IP を取得します。ここで削除を忘れると、Calico 時代の古い IP を持った
-まま残り、次の CNI 導入後に `CrashLoopBackOff` します。
+と同じ理由で、CoreDNS は Calico のインターフェース/CNI 設定を削除する**前**に 0 replica へ
+scale しています。Pod を消すには kubelet が CNI DEL を呼んでネットワークを片付ける必要が
+あり、それには CNI 設定がまだ存在している必要があるためです (先に CNI を消してから
+`kubectl delete pod` すると `Terminating` のまま固まります)。CNI 削除が終わった**後**に
+元の replica 数へ戻すことで、新しい CoreDNS Pod は `Pending` のまま待機し、次にどの CNI
+(Flannel や Cilium) を導入した瞬間にも自動的にスケジュールされ、新しい IP を取得します。
+ここで scale を戻し忘れると、CoreDNS の Pod 数が 0 のまま次章に進んでしまいます。
 
 クラスタは [00-setup.md](00-setup.md) 完了直後と同じ CNI 未導入の状態に戻りました。
 続けて [01-flannel.md](01-flannel.md) や [03-cilium.md](03-cilium.md) を、

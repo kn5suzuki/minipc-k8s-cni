@@ -9,19 +9,28 @@ Flannel は最もシンプルな Kubernetes CNI プラグインです。
 - **ネットワークポリシーは非対応** (シンプルさを優先)
 - CoreOS/Flannel チームが開発。歴史が長く情報が豊富
 
+外側の枠が **ノード**、内側の枠が **Pod の netns** を表す。ノードの中では
+`netns → veth → cni0 → flannel.1 → enp1s0` の順に接続され、ノードをまたぐ区間
+(`enp1s0` の外、両ノードの間) だけが VXLAN でカプセル化される:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  worker1 (10.244.1.0/24)         worker2 (10.244.2.0/24)    │
-│  ┌──────────┐                    ┌──────────┐               │
-│  │  Pod A   │                    │  Pod B   │               │
-│  │10.244.1.2│                    │10.244.2.2│               │
-│  └────┬─────┘                    └────┬─────┘               │
-│       │ veth                          │ veth                │
-│  ┌────┴─────┐  VXLAN (UDP/8472)  ┌────┴─────┐               │
-│  │  cni0    ├──────────────────►─┤  cni0    │               │
-│  │ bridge   │ flannel.1 ↔ enp1s0 │ bridge   │               │
-│  └──────────┘                    └──────────┘               │
-└─────────────────────────────────────────────────────────────┘
+worker1 (10.244.1.0/24)                  worker2 (10.244.2.0/24)
+┌──────────────────────────────┐         ┌──────────────────────────────┐
+│    ┌─── Pod A netns ────┐    │         │    ┌─── Pod B netns ────┐    │
+│    │  eth0 10.244.1.2   │    │         │    │  eth0 10.244.2.2   │    │
+│    └──────────┬─────────┘    │         │    └──────────┬─────────┘    │
+│               │ veth         │         │               │ veth         │
+│               │              │         │               │              │
+│           cni0 (Linux Bridge)│         │           cni0 (Linux Bridge)│
+│               │ 10.244.1.1   │         │               │ 10.244.2.1   │
+│               │              │         │               │              │
+│          flannel.1 (VXLAN)   │         │          flannel.1 (VXLAN)   │
+│               │              │         │               │              │
+│            enp1s0            │         │            enp1s0            │
+└───────────────┴──────────────┘         └───────────────┴──────────────┘
+                │ 192.168.100.12                         │ 192.168.100.13
+                │                                        │
+                └──── VXLAN encapsulation (UDP/8472) ────┘
 ```
 
 ---
@@ -66,7 +75,104 @@ kubectl get pods -n kube-system | grep coredns
 
 ---
 
-## 1.2 テスト用 Pod をデプロイ
+## 1.2 Flannel が配置したもの
+
+### kube-flannel-cfg ConfigMap (クラスタ全体の設定)
+
+クラスタに1つだけ存在するこの ConfigMap が、`kube-flannel-ds` が各ノードで何をするかの
+元ネタになる:
+
+```bash
+kubectl get configmap -n kube-flannel kube-flannel-cfg -o yaml
+```
+
+```yaml
+data:
+  cni-conf.json: |
+    {
+      "name": "cbr0",
+      "plugins": [
+        { "type": "flannel", "delegate": { "hairpinMode": true, "isDefaultGateway": true } },
+        { "type": "portmap", "capabilities": { "portMappings": true } }
+      ]
+    }
+  net-conf.json: |
+    {
+      "Network": "10.244.0.0/16",
+      "Backend": { "Type": "vxlan" }
+    }
+```
+
+- `cni-conf.json`: 後述の「CNI 設定ファイル」で見るノードごとの `10-flannel.conflist` の
+  クラスタ共通テンプレート。`kube-flannel-ds` が起動時にこれをそのままノードのローカル
+  ファイルへコピーする。
+- `net-conf.json` の `Network`: クラスタ全体の Pod ネットワーク。`kubeadm init
+  --pod-network-cidr` で指定した値と一致している必要がある (不一致だとノードごとの `/24`
+  払い出しが壊れる)。
+- `net-conf.json` の `Backend.Type`: `"vxlan"`。ここが `"host-gw"` 等に変わると
+  `flannel.1` は使われず直接ルーティングになり、本章で見る VXLAN 周りの挙動全体が変わる。
+
+### kube-flannel-ds
+
+`kube-flannel-ds` は各ノードに1台ずつ配置される DaemonSet Pod で、上の ConfigMap を読み込んで
+そのノードの CNI プラグインとして動作する。起動時にホスト上へ `flannel.1` VXLAN インターフェース
+と CNI 設定ファイル (`/etc/cni/net.d/10-flannel.conflist`) を配置し、Kubernetes API から
+全ノードの割り当て済み PodCIDR (`10.244.x.0/24`) を読み取ってルーティングテーブルと VXLAN の
+FDB (転送先 MAC/IP) を構築・維持する。この Pod がまだ `Running` になっていない (= ノードに CNI
+が導入されていない) 間は、そのノードは `NotReady` のままとなる (1.1 で確認した通り)。
+
+### CNI 設定ファイル (10-flannel.conflist)
+
+kubelet は `/etc/cni/net.d/` 内でファイル名が辞書順で最も早い `*.conflist`/`*.conf` を採用する
+(ここでは `10-flannel.conflist` のみなのでそれが使われる)。`kube-flannel-ds` が上の ConfigMap
+の `cni-conf.json` をそのままコピーしたものであることを、worker1 に SSH して確認する:
+
+```bash
+ssh ubuntu@worker1 'cat /etc/cni/net.d/10-flannel.conflist'
+# {
+#   "name": "cbr0",
+#   "cniVersion": "0.3.1",
+#   "plugins": [
+#     { "type": "flannel", "delegate": { "hairpinMode": true, "isDefaultGateway": true } },
+#     { "type": "portmap", "capabilities": { "portMappings": true } }
+#   ]
+# }
+```
+
+中身は2つの CNI プラグインの chain:
+
+1. **`flannel`**: `kube-flannel-ds` が書き出した `/run/flannel/subnet.env`
+   (このノードに割り当てられた `10.244.x.0/24` などが入っている) を読み取り、
+   実際の veth 作成やブリッジ接続は `bridge` プラグイン (`cni0`) に委譲する。
+2. **`portmap`**: `hostPort` を指定した Pod のポートフォワーディング (iptables DNAT) を担当する。
+
+Pod 間の実際の通信でこれらがどう使われるかは、1.4 で `cni0`/veth を構築したうえで、
+1.5 (同一ノード内) と 1.6 (ノードをまたぐ) で確認します。
+
+### flannel.1 (VXLAN インターフェース)
+
+`kube-flannel-ds` が ConfigMap の `net-conf.json` (`Backend.Type: vxlan`) に従って
+実際にホスト側へ何を配置したか、worker1 に SSH して確認する:
+
+```bash
+ssh ubuntu@worker1 'ip -d link show flannel.1'
+# 4: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 ... state UNKNOWN
+#     link/ether ...
+#     vxlan id 1 local 192.168.100.12 dev enp1s0 srcport 0 0 dstport 8472 \
+#       nolearning ttl auto ageing 300 noudpcsum ...
+```
+
+- `vxlan id 1`: VXLAN Network Identifier (VNI)。全ノードで固定値 1。
+- `local 192.168.100.12 dev enp1s0`: このノードの管理用アドレスを送信元として、
+  物理 NIC (`enp1s0`) 経由でカプセル化パケットを送る設定。
+- `dstport 8472`: VXLAN の宛先 UDP ポート。IANA 標準の 4789 ではなく Flannel 独自の 8472 を使う。
+- `nolearning`: 通常の VXLAN は初回送信時に ARP/送信元 MAC から FDB (宛先 MAC → リモート VTEP IP の対応表)
+  を学習するが、Flannel はこれを無効化し、`kube-flannel-ds` が Kubernetes API から得た
+  全ノードの情報をもとに FDB エントリを直接プログラムする (1.6 で `bridge fdb show dev flannel.1` を確認する)。
+
+---
+
+## 1.3 テスト用 Pod をデプロイ
 
 ```bash
 # nginx (DaemonSet/Service) と debug Pod をまとめてデプロイ
@@ -87,27 +193,103 @@ kubectl get pods -o wide
 
 ---
 
-## 1.3 同一ノード内の Pod 間通信
+## 1.4 Flannel が Pod 用に構築したもの
+
+1.2 で見た `flannel.1` や CNI 設定ファイルはノードに CNI が導入された時点で存在するが、
+`cni0` Linux Bridge と各 Pod の veth pair は、そのノードに **Pod が1つもスケジュールされて
+いない間は存在しない**。conflist の `flannel` プラグインが委譲する `bridge` プラグインは、
+最初の Pod (ADD リクエスト) が来て初めて `cni0` を作成するため。1.3 で初めて Pod が
+デプロイされたことで、worker1 上にこれらが作られたことを確認する。
+
+### cni0 ブリッジ
+
+```bash
+ssh ubuntu@worker1 'ip -d addr show cni0'
+# 5: cni0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 ...
+#     link/ether ...
+#     inet 10.244.1.1/24 brd 10.244.1.255 scope global cni0
+#     bridge ...
+```
+
+- `inet 10.244.1.1/24`: このノードの Pod サブネット (`/run/flannel/subnet.env` の
+  `FLANNEL_SUBNET`) の先頭アドレス。Pod からのデフォルトゲートウェイになる
+  (1.8 で `kubectl exec debug -- ip route` から確認する)。
+- `mtu 1450`: VXLAN ヘッダ (50 byte) 分を差し引いた値。物理 NIC の MTU 1500 と揃えるための調整。
+
+### veth pair
+
+```bash
+ssh ubuntu@worker1 'brctl show cni0'
+# bridge name  bridge id          STP  interfaces
+# cni0         8000.xxxxxxxxx     no   veth1234abc
+#                                      veth5678def
+```
+
+worker1 上の Pod (`nginx-ds`, `debug`) の数だけ veth が `cni0` にぶら下がっている。
+`bridge` プラグインが Pod ごとに veth pair を作成し、ホスト側の一端を `cni0` に接続、
+コンテナ側の一端を Pod の netns 内に移動させて `eth0` にリネームする:
+
+```bash
+ssh ubuntu@worker1 'ip link show type veth'
+# vethXXXX@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> ... master cni0
+```
+
+### ここまでで構築されたインターフェース構成
+
+1.2 (`flannel.1`) と本節 (`cni0`・veth) を合わせると、worker1 上には次のようなインターフェースの
+連なりが出来上がっている:
+
+```
+worker1 (192.168.100.12)
+┌──────────────────────────────────────────────────────────────┐
+│  debug Pod netns         nginx-ds Pod netns                  │
+│  ┌─────────────┐         ┌─────────────┐                     │
+│  │ eth0        │         │ eth0        │                     │
+│  │10.244.1.y/24│         │10.244.1.x/24│                     │
+│  └──────┬──────┘         └──────┬──────┘                     │
+│         │ veth pair             │ veth pair                  │
+│  ┌──────┴───────────────────────┴─--─────┐                   │
+│  │        cni0 (Linux Bridge)            │                   │
+│  │        10.244.1.1/24, mtu 1450        │                   │
+│  └────────────────────┬──────────────────┘                   │
+│                       │                                      │
+│  ┌────────────────────┴──────────────────┐                   │
+│  │ flannel.1 (VXLAN, vni 1, mtu 1450)    │                   │
+│  └────────────────────┬-─────────────────┘                   │
+│                       │ VXLAN カプセル化                       │
+│                       │ (UDP/8472, ノードをまたぐ場合のみ)       │
+│  ┌────────────────────┴───────────────────┐                  │
+│  │  enp1s0 (物理 NIC, 192.168.100.12)      │                 │
+│  └────────────────────────────────────────┘                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**ポイント**: 同一ノード内 (`eth0` → `cni0`) は通常の L2 ブリッジング、
+ノードをまたぐ場合のみ `cni0` → `flannel.1` → `enp1s0` という経路で VXLAN カプセル化される。
+それぞれ 1.5 (同一ノード内) と 1.6 (ノードをまたぐ) で実際のパケットを見ながら確認する。
+
+---
+
+## 1.5 同一ノード内の Pod 間通信
 
 ノードをまたぐ通信を見る前に、まず **同じノード上の Pod 同士** が Flannel 環境で
 どう通信するかを確認します。ここでは VXLAN の出番がなく、Linux Bridge (`cni0`)
 だけで完結することがポイントです。
 
 ```bash
-# debug Pod と同じノード上の nginx を選ぶ
-DEBUG_NODE=$(kubectl get pod debug -o jsonpath='{.spec.nodeName}')
-NGINX_SAME=$(kubectl get pod -l app=nginx-ds -o wide | grep $DEBUG_NODE | awk '{print $6}')
-echo "same-node target: $NGINX_SAME (on $DEBUG_NODE)"
+# debug Pod と同じノード (worker1) 上の nginx を選ぶ
+NGINX_W1=$(kubectl get pod -l app=nginx-ds -o wide | grep worker1 | awk '{print $6}')
+kubectl exec debug -- ping -c3 $NGINX_W1
 
-kubectl exec debug -- ping -c3 $NGINX_SAME
-kubectl exec debug -- wget -qO- $NGINX_SAME
+# curl で HTTP レスポンス確認
+kubectl exec debug -- wget -qO- $NGINX_W1
 ```
 
 ### ルーティングを確認: flannel.1 を経由しない
 
 ```bash
-ssh ubuntu@$DEBUG_NODE "ip route get $NGINX_SAME"
-# NGINX_SAME dev cni0 src ...
+ssh ubuntu@worker1 "ip route get $NGINX_W1"
+# NGINX_W1 dev cni0 src ...
 # ★ flannel.1 ではなく cni0 (Linux Bridge) 経由 = 同一ブリッジ内のスイッチング
 ```
 
@@ -118,8 +300,8 @@ VXLAN トンネルは一切関与しません。
 
 ```bash
 # 物理 NIC でキャプチャしても同一ノード内の通信は見えないはず
-ssh ubuntu@$DEBUG_NODE 'sudo timeout 5 tcpdump -i enp1s0 -n icmp -c3'  &
-kubectl exec debug -- ping -c3 $NGINX_SAME
+ssh ubuntu@worker1 'sudo timeout 5 tcpdump -i enp1s0 -n icmp -c3'  &
+kubectl exec debug -- ping -c3 $NGINX_W1
 wait
 # パケット 0 件 = enp1s0 (物理 NIC) をまったく経由していない証拠
 ```
@@ -127,22 +309,22 @@ wait
 ### cni0 ブリッジ上ではそのまま見える
 
 ```bash
-ssh ubuntu@$DEBUG_NODE 'sudo timeout 5 tcpdump -i cni0 -n icmp -c3' &
-kubectl exec debug -- ping -c3 $NGINX_SAME
+ssh ubuntu@worker1 'sudo timeout 5 tcpdump -i cni0 -n icmp -c3' &
+kubectl exec debug -- ping -c3 $NGINX_W1
 wait
 # cni0 上では Pod IP 同士のパケットがカプセル化なしでそのまま見える
 ```
 
 **まとめ**: 同一ノード内は `cni0` による通常の L2 ブリッジングのみ。
-次の 1.4 で確認する「ノードをまたぐ通信」だけが VXLAN カプセル化
+次の 1.6 で確認する「ノードをまたぐ通信」だけが VXLAN カプセル化
 (`flannel.1`) を必要とします。
 
 ---
 
-## 1.4 ノードをまたいだ Pod 間通信の確認
+## 1.6 ノードをまたいだ Pod 間通信
 
-1.3 とは対照的に、ここでは意図的に **別ノード (worker2)** 上の nginx を選び、
-VXLAN オーバーレイ経由の通信を確認します。
+**別ノード (worker2)** 上の nginx を選び、VXLAN オーバーレイ経由の通信を確認します。以下、1.5 と同じ手順 (ping/wget →
+ルーティング確認 → パケットキャプチャ) を辿りながら、結果がどう変わるかを見比べます。
 
 ```bash
 # debug Pod から worker2 の nginx に ping
@@ -153,24 +335,39 @@ kubectl exec debug -- ping -c3 $NGINX_W2
 kubectl exec debug -- wget -qO- $NGINX_W2
 ```
 
----
-
-## 1.5 Flannel のネットワーク構造を観察
-
-### VXLAN デバイス (flannel.1) を見る
+### ルーティング
 
 ```bash
-ssh ubuntu@worker1 'ip -d link show flannel.1'
-# flannel.1: <...> mtu 1450 ...
-#     vxlan id 1 local 192.168.100.12 dev enp1s0 srcport 0 0 dstport 8472 nolearning
-#     ^^^^^^^^^^^^
-#     VNI=1, VXLAN カプセル化, UDP 8472 番ポート使用
+ssh ubuntu@worker1 "ip route get $NGINX_W2"
+# NGINX_W2 dev flannel.1 src ...
+# ★ 1.5 の cni0 とは違い、今度は flannel.1 経由 = VXLAN トンネルへ
+
+ssh ubuntu@worker1 'ip route'
+# 10.244.0.0/24 via 10.244.0.0 dev flannel.1 onlink   # control の Pod サブネット
+# 10.244.1.0/24 dev cni0 proto kernel scope link        # 自分の Pod サブネット (cni0)
+# 10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink   # worker2 の Pod サブネット
 ```
 
-**ポイント**: `id 1` が VXLAN Network Identifier (VNI)。
-Flannel は全クラスタで VNI=1 を使用します。
+**ポイント**: 1.5 では宛先が自ノードの Pod サブネットだったため `cni0` 止まりでしたが、
+ここでは宛先 (worker2 の `10.244.2.0/24`) が他ノードの Pod サブネットなので `flannel.1`
+経由でルーティングされます。VXLAN トンネルが初めて関与します。
 
-### FDB (Forwarding Database) を見る
+### MAC アドレス解決
+
+```bash
+ssh ubuntu@worker1 'ip neigh show dev flannel.1'
+# 10.244.2.0 dev flannel.1 lladdr yy:yy:yy:yy:yy:yy PERMANENT
+```
+
+**ポイント**: `ip route get` が示した nexthop `10.244.2.0` はまだ L3 アドレスです。
+フレームを送るには MAC アドレス (L2) への解決が要りますが、Flannel は通常の ARP に頼らず
+`kube-flannel-ds` が Kubernetes API 経由でこの近隣キャッシュも静的に (`PERMANENT`)
+プログラムします (1.2 で見た `nolearning` と対になる仕組みです)。
+
+### flannel.1 でのエンキャップ
+
+ここまでで宛先 MAC アドレス (`yy:yy:yy:yy:yy:yy`) は分かりましたが、それが VXLAN 的に
+どのノード (VTEP) 宛てにカプセル化すべきかはまだ分かりません。それを解決するのが FDB です。
 
 ```bash
 ssh ubuntu@worker1 'bridge fdb show dev flannel.1'
@@ -180,52 +377,21 @@ ssh ubuntu@worker1 'bridge fdb show dev flannel.1'
 #                   各ノードの flannel.1 MAC → ノード IP のマッピング
 ```
 
-**ポイント**: これが VXLAN トンネルの宛先テーブル。
-Flannel は etcd/k8s API 経由で各ノードの flannel.1 MAC アドレスとノード IP を共有します。
+**ポイント**: `ip neigh` の MAC アドレス (`yy:yy:yy:yy:yy:yy`) をこの FDB で引くと
+`dst 192.168.100.13` (worker2) が見つかります。これでようやく VXLAN カプセル化の宛先
+ノード IP が確定します。この FDB も `nolearning` により ARP と同様、`kube-flannel-ds` が
+K8s API 経由で直接プログラムします。
 
-### ルーティングテーブルを見る
-
-```bash
-ssh ubuntu@worker1 'ip route'
-# 10.244.0.0/24 via 10.244.0.0 dev flannel.1 onlink   # control の Pod サブネット
-# 10.244.1.0/24 dev cni0 proto kernel scope link        # 自分の Pod サブネット (cni0)
-# 10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink   # worker2 の Pod サブネット
-```
-
-**ポイント**: 他ノードの Pod サブネットは `flannel.1` 経由でルーティング。
-自ノードの Pod サブネットは `cni0` (Linux bridge) 経由。
-
-### Pod の veth pair と cni0 bridge を見る
+### 物理 NIC でキャプチャ: 今度は VXLAN パケットが見える
 
 ```bash
-ssh ubuntu@worker1 'brctl show cni0'
-# bridge name  bridge id          STP  interfaces
-# cni0         8000.xxxxxxxxx     no   veth1234abc
-#                                      veth5678def
-
-ssh ubuntu@worker1 'ip link show type veth'
-# vethXXXX: → Pod の veth もう一方は Pod の netns 内の eth0
-```
-
-**ポイント**: Pod ⇄ cni0 ⇄ flannel.1 という経路。
-Pod 内の eth0 と cni0 上の veth は一対のトンネル (veth pair)。
-
-### VXLAN カプセル化をキャプチャする
-
-worker1 と worker2 の Pod 間通信を物理 NIC でキャプチャ:
-
-```bash
-# ホストの別ターミナルで worker1 にてキャプチャ開始
+# 物理NIC で見えないことを確認した 1.5 とは対照的に、ここではキャプチャに残す
 ssh ubuntu@worker1 'sudo tcpdump -i enp1s0 -n udp port 8472 -w /tmp/flannel.pcap' &
 
-# debug Pod からノードをまたいだ通信
-NGINX_W2=$(kubectl get pod -l app=nginx-ds -o wide | grep worker2 | awk '{print $6}')
 kubectl exec debug -- wget -qO- $NGINX_W2
 
-# キャプチャ停止 (worker1 で Ctrl+C または)
 ssh ubuntu@worker1 'sudo pkill tcpdump'
 
-# パケット確認
 ssh ubuntu@worker1 'sudo tcpdump -r /tmp/flannel.pcap -n -v | head -20'
 # 192.168.100.12.xxxx > 192.168.100.13.8472: VXLAN, flags [I] (0x08), vni 1
 # IP 10.244.1.y > 10.244.2.x: ...
@@ -234,7 +400,12 @@ ssh ubuntu@worker1 'sudo tcpdump -r /tmp/flannel.pcap -n -v | head -20'
 # 内側: Pod IP (10.244.x.x) が元のパケット
 ```
 
-### Pod サブネット割り当てを確認
+**まとめ**: 1.5 (同一ノード内) は `cni0` の L2 ブリッジングだけで完結し、物理 NIC には
+一切パケットが出ませんでした。1.6 (ノードをまたぐ) では `flannel.1` が FDB を参照して
+宛先ノードの VTEP (ノード IP) 向けに VXLAN カプセル化し、物理 NIC 上にノード IP 同士の
+UDP/8472 パケットとして現れます。
+
+### 参考: Pod サブネット割り当て
 
 ```bash
 # 各ノードが持つ Pod サブネット (Node annotation)
@@ -245,13 +416,17 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.pod
 ```
 
 **ポイント**: kubeadm init で `--pod-network-cidr=10.244.0.0/16` を指定したため、
-各ノードに自動で `/24` が配られています。
+各ノードに自動で `/24` が配られています。1.5/1.6 で見た `cni0`/`flannel.1` の
+ルーティング先はこの割り当てに基づきます。
 
 ---
 
-## 1.6 Service の通信経路 (kube-proxy × iptables)
+## 1.7 Service の通信経路 (kube-proxy × iptables)
 
-Flannel 環境では kube-proxy が iptables を使って Service の ClusterIP → Pod に転送します。
+Flannel 自体は Service を扱わず、ClusterIP → Pod の変換は kube-proxy が iptables で行います。
+Flannel が受け持つのは、その変換後の宛先 Pod IP への実際の転送 (1.5/1.6 で見た経路) です。
+以下、ClusterIP 宛てのパケットが最終的にどの Pod IP に化けるかを iptables のチェーンを
+辿って確認し、そこから先が 1.5/1.6 と同じであることを見ます。
 
 ```bash
 # Service の ClusterIP を確認
@@ -261,21 +436,62 @@ kubectl get svc nginx-svc
 
 CLUSTER_IP=$(kubectl get svc nginx-svc -o jsonpath='{.spec.clusterIP}')
 
-# worker1 の iptables で DNAT ルールを確認
-ssh ubuntu@worker1 "sudo iptables -t nat -L KUBE-SERVICES -n | grep $CLUSTER_IP"
-# KUBE-SVC-xxx  tcp  -- 0.0.0.0/0  10.96.x.y  tcp dpt:80
-
 # ClusterIP 宛てに curl (debug Pod から)
 kubectl exec debug -- wget -qO- $CLUSTER_IP
 ```
 
+### KUBE-SERVICES: ClusterIP 宛てを検知する
+
+```bash
+ssh ubuntu@worker1 "sudo iptables -t nat -L KUBE-SERVICES -n | grep $CLUSTER_IP"
+# KUBE-SVC-xxx  tcp  -- 0.0.0.0/0  10.96.x.y  tcp dpt:80
+```
+
+**ポイント**: `KUBE-SERVICES` は全 Service 共通の入口チェーン。宛先 IP:port が
+ClusterIP:port に一致するパケットを、この Service 専用の `KUBE-SVC-xxx` チェーンへ
+`-j` で飛ばします。
+
+### KUBE-SVC-xxx: バックエンド Pod をランダムに選ぶ
+
+```bash
+ssh ubuntu@worker1 "sudo iptables -t nat -L KUBE-SVC-xxx -n"
+# KUBE-SEP-aaa  all  --  0.0.0.0/0  0.0.0.0/0  statistic mode random probability 0.33333
+# KUBE-SEP-bbb  all  --  0.0.0.0/0  0.0.0.0/0  statistic mode random probability 0.50000
+# KUBE-SEP-ccc  all  --  0.0.0.0/0  0.0.0.0/0
+```
+
+**ポイント**: nginx-ds は DaemonSet なので Endpoints は3つ (各ノード1つずつ)。
+`statistic mode random probability` で確率的に1つの `KUBE-SEP-xxx` (Service Endpoint =
+Pod 1つに対応) へ振り分けます。1.5/1.6 で同一ノード/別ノードを明示的に選んでいたのに対し、
+Service 経由ではどの Pod に転送されるかは毎回ランダムです。
+
+### KUBE-SEP-xxx: 実際の DNAT
+
+```bash
+ssh ubuntu@worker1 "sudo iptables -t nat -L KUBE-SEP-aaa -n"
+# DNAT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp to:10.244.1.x:80
+```
+
+**まとめ**: `KUBE-SERVICES → KUBE-SVC-xxx → KUBE-SEP-xxx` で ClusterIP:80 が
+最終的に特定の Pod IP:80 (例: `10.244.1.x:80`) へ DNAT されます。DNAT が済んだ
+時点でパケットは通常の Pod 宛てパケットと同じになるため、そこから先の転送経路は
+選ばれた Pod が同一ノードか別ノードかによって 1.5 (`cni0` のみ) か 1.6 (`flannel.1`
+経由の VXLAN) のどちらかに合流します。Flannel から見ると Service は関知しない、
+kube-proxy が Pod IP を差し替えるだけの前段処理です。
+
 ---
 
-## 1.7 Pod からインターネットへの疎通
+## 1.8 Pod からインターネットへの疎通
 
 Pod IP (`10.244.x.x`) はクラスタ外にはルーティングされないプライベートな
 アドレスです。それでも Pod から外部と通信できるのは、**ノードが Pod の送信元
 IP を自分自身の IP に変換 (SNAT/MASQUERADE) してから外に送り出している**ためです。
+
+ここまでの 1.4〜1.7 で見た `cni0`/`flannel.1` は Pod ネットワーク**内部**の転送を
+担うものでしたが、Flannel の役割はそれだけではありません。クラスタ**外**への出口
+(egress) の NAT 設定もあわせて自分自身の責務として持っており、`kube-flannel-ds`
+(実体は `flanneld`) が各ノード起動時にこの節で見る MASQUERADE ルールを iptables へ
+自動で追加します。kube-proxy や Kubernetes 本体はこの設定に一切関与しません。
 
 ```bash
 # Pod からインターネット (外部) に到達できることを確認
@@ -322,15 +538,6 @@ kubectl exec debug -- ping -c3 8.8.8.8
 
 ---
 
-## 1.8 Flannel の設定ファイルを確認
-
-```bash
-# Flannel の ConfigMap (Pod サブネットの設定)
-kubectl get configmap -n kube-flannel kube-flannel-cfg -o yaml
-```
-
----
-
 ## 1.9 Flannel のまとめ
 
 | 項目           | Flannel の動作                              |
@@ -346,27 +553,47 @@ kubectl get configmap -n kube-flannel kube-flannel-cfg -o yaml
 
 ## 1.10 Flannel のアンインストール (CNI 未導入の状態に戻す)
 
+**参考**: 以下の手順 3〜5 (Flannel 本体・各ノードのインターフェース・CNI 設定ファイルの削除) は、
+ホスト側で `make uninstall` を実行すれば1コマンドで完了します (`Makefile` の `uninstall`
+ターゲットの実体がまさにこの操作です)。ただし `make uninstall` は手順 1 (テスト用リソースの
+削除) と手順 2・6 (CoreDNS の scale 操作) はカバーしていません — これらは次章の冒頭でも改めて
+必要になった際に手動で対応できるようになっているため、意図的にスコープ外です。学習目的で
+一つずつ確認したい場合や、手順 1・2・6 も含めて完全に戻したい場合は、以下を手動で実行してください。
+
+**注意**: CoreDNS Pod は `kubectl delete pod` ではなく、Deployment を一時的に 0 replica に
+`scale` することで削除します。Pod を消すには kubelet が CNI DEL を呼んでネットワークを
+片付ける必要があり、それには CNI 設定がまだ存在している必要があります。先に CNI (手順 3〜5)
+を消してから Pod を削除しようとすると、kubelet が CNI DEL を完了できず Pod が
+`Terminating` のまま永遠に固まります。そのため CoreDNS の削除は CNI 削除より**前**に、
+再作成 (scale を元に戻す) は CNI 削除より**後**に行います。
+
 ```bash
 # 1. テスト用リソースを削除 (Flannel の IP を持ったまま残さない)
 kubectl delete -f manifests/nginx-ds.yaml --ignore-not-found
 
-# 2. Flannel 本体を削除
+# 2. CoreDNS を一時的に 0 replica にする (CNI がまだ生きている今のうちに
+#    Pod をきれいに削除させる。ReplicaSet による再作成も防げる)
+COREDNS_REPLICAS=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}')
+kubectl scale deployment coredns -n kube-system --replicas=0
+kubectl wait --for=delete pod -n kube-system -l k8s-app=kube-dns --timeout=60s
+
+# 3. Flannel 本体を削除
 kubectl delete -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 
-# 3. 各ノードの Flannel が作ったインターフェースを削除
+# 4. 各ノードの Flannel が作ったインターフェースを削除
 for node in control worker1 worker2; do
   ssh ubuntu@$node 'sudo ip link delete flannel.1 2>/dev/null; sudo ip link delete cni0 2>/dev/null; true'
 done
 
-# 4. CNI 設定ファイルを削除
+# 5. CNI 設定ファイルを削除
 for node in control worker1 worker2; do
   ssh ubuntu@$node 'sudo rm -f /etc/cni/net.d/10-flannel.conflist'
 done
 
-# 5. CoreDNS Pod を削除 (必ず手順 3・4 の後に行う)
-#    → CNI が存在しない状態になるので Pending のまま待機する
-#    ここを忘れると Flannel 時代の古い IP が残り、次に別の CNI を入れたときに CrashLoopBackOff する
-kubectl delete pod -n kube-system -l k8s-app=kube-dns
+# 6. CoreDNS を元の replica 数に戻す
+#    → CNI が存在しない状態で新しい Pod が作られるので Pending のまま待機する
+#    ここで戻し忘れると、次章で CNI を入れても CoreDNS の Pod 数が 0 のままになる
+kubectl scale deployment coredns -n kube-system --replicas=$COREDNS_REPLICAS
 ```
 
 `Pending` になっていることを確認:

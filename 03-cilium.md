@@ -203,7 +203,7 @@ ssh ubuntu@$DEBUG_NODE 'sudo pkill tcpdump'
 ssh ubuntu@$DEBUG_NODE 'sudo tcpdump -r /tmp/cilium-vxlan.pcap -n -v | head -10'
 # 192.168.100.12.xxxx > 192.168.100.13.8472: VXLAN, flags [I] (0x08), vni ...
 # IP 10.244.x.x > 10.244.y.y: ...
-# 外側: ノード IP + VXLAN、内側: Pod IP (Flannel の 1.4 と同じ構造)
+# 外側: ノード IP + VXLAN、内側: Pod IP (Flannel の 1.6 と同じ構造)
 ```
 
 **まとめ**: 同一ノード内は eBPF による veth 間の直接 redirect、ノードをまたぐ
@@ -538,32 +538,44 @@ ssh ubuntu@worker1 'sudo iptables-save | wc -l'
 
 ## 3.15 Cilium のアンインストール (CNI 未導入の状態に戻す)
 
+**注意**: CoreDNS は `kubectl delete pod` ではなく Deployment の `scale` で扱います。
+Pod を消すには kubelet が CNI DEL を呼んでネットワークを片付ける必要があり、それには
+CNI 設定がまだ存在している必要があります。先に CNI (手順 3・4) を消してから Pod を削除
+しようとすると、kubelet が CNI DEL を完了できず Pod が `Terminating` のまま固まります
+(01 章 1.10 と同じ理由)。
+
 ```bash
 # 1. テスト用リソースを削除 (Cilium の IP を持ったまま残さない)
 kubectl delete -f manifests/nginx-ds.yaml --ignore-not-found
 
-# 2. Cilium 本体を削除
+# 2. CoreDNS を一時的に 0 replica にする (CNI がまだ生きている今のうちに
+#    Pod をきれいに削除させる。ReplicaSet による再作成も防げる)
+COREDNS_REPLICAS=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}')
+kubectl scale deployment coredns -n kube-system --replicas=0
+kubectl wait --for=delete pod -n kube-system -l k8s-app=kube-dns --timeout=60s
+
+# 3. Cilium 本体を削除
 helm uninstall cilium -n kube-system
 
-# 3. 各ノードの Cilium が作ったインターフェースを削除
+# 4. 各ノードの Cilium が作ったインターフェースを削除
 for node in control worker1 worker2; do
   ssh ubuntu@$node 'sudo ip link delete cilium_vxlan 2>/dev/null; \
     sudo ip link delete cilium_host 2>/dev/null; \
     sudo ip link delete cilium_net 2>/dev/null; true'
 done
 
-# 4. CNI 設定ファイルを削除
+# 5. CNI 設定ファイルを削除
 for node in control worker1 worker2; do
   ssh ubuntu@$node 'sudo rm -f /etc/cni/net.d/*.conf /etc/cni/net.d/*.conflist'
 done
 
-# 5. kube-proxy を復元 (3.3 で kubeProxyReplacement のために削除済みのため)
+# 6. kube-proxy を復元 (3.3 で kubeProxyReplacement のために削除済みのため)
 ssh ubuntu@control 'sudo kubeadm init phase addon kube-proxy'
 
-# 6. CoreDNS Pod を削除 (必ず手順 3・4 の後に行う)
-#    → CNI が存在しない状態になるので Pending のまま待機する
-#    ここを忘れると Cilium 時代の古い IP が残り、次に別の CNI を入れたときに CrashLoopBackOff する
-kubectl delete pod -n kube-system -l k8s-app=kube-dns
+# 7. CoreDNS を元の replica 数に戻す
+#    → CNI が存在しない状態で新しい Pod が作られるので Pending のまま待機する
+#    ここで戻し忘れると、次章で CNI を入れても CoreDNS の Pod 数が 0 のままになる
+kubectl scale deployment coredns -n kube-system --replicas=$COREDNS_REPLICAS
 ```
 
 `Pending` になっていることを確認:

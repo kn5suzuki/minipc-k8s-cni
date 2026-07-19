@@ -40,10 +40,11 @@ metadata:
   labels:
     run: debug
 spec:
+  nodeName: worker1
   restartPolicy: Never
   containers:
   - name: debug
     image: busybox:latest
     args:
     - sleep
-    - "3600"
+    - infinity
