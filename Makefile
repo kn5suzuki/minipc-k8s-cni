@@ -152,8 +152,13 @@ k8s-init: k8s-prereq
 	@echo ">>> Copying kubeconfig to host..."
 	mkdir -p ~/.kube
 	$(SCP) ubuntu@control:~/.kube/config ~/.kube/k8s-lab.config
-	@echo ">>> kubeconfig saved to ~/.kube/k8s-lab.config"
-	@echo ">>> Run: export KUBECONFIG=~/.kube/k8s-lab.config"
+	@echo ">>> Merging into ~/.kube/config so plain 'kubectl' also works..."
+	@touch ~/.kube/config
+	@KUBECONFIG=~/.kube/config:~/.kube/k8s-lab.config kubectl config view --flatten > ~/.kube/config.new
+	@mv ~/.kube/config.new ~/.kube/config
+	@chmod 600 ~/.kube/config
+	@KUBECONFIG=~/.kube/config kubectl config use-context kubernetes-admin@kubernetes >/dev/null
+	@echo ">>> kubeconfig saved to ~/.kube/k8s-lab.config and merged into ~/.kube/config (current-context set to this cluster)"
 
 k8s-join: k8s-init
 	@echo ">>> Joining worker nodes..."
@@ -172,7 +177,7 @@ uninstall:
 	$(SSH) ubuntu@control 'kubectl delete -f \
 	  https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml \
 	  2>/dev/null || true'
-	$(SSH) ubuntu@control 'kubectl delete ns calico-system tigera-operator 2>/dev/null || true; \
+	$(SSH) ubuntu@control 'kubectl delete ns calico-system calico-apiserver tigera-operator 2>/dev/null || true; \
 	  kubectl get crds 2>/dev/null | grep -E "calico|tigera" | awk "{print \$$1}" | \
 	  xargs kubectl delete crd 2>/dev/null || true'
 	$(SSH) ubuntu@control 'helm uninstall cilium -n kube-system 2>/dev/null || true'
@@ -215,8 +220,17 @@ spec:\n\
       natOutgoing: Enabled\n\
       nodeSelector: all()\n\
 EOF'
+	@echo ">>> Installing APIServer CR (needed to later modify IPPools, e.g. IPIP -> BGP native)..."
+	$(SSH) ubuntu@control 'kubectl apply -f - <<EOF\n\
+apiVersion: operator.tigera.io/v1\n\
+kind: APIServer\n\
+metadata:\n\
+  name: default\n\
+spec: {}\n\
+EOF'
 	@echo ">>> Waiting for calico-node DaemonSet (up to 3 min)..."
 	$(SSH) ubuntu@control 'kubectl rollout status daemonset/calico-node -n calico-system --timeout=180s'
+	$(SSH) ubuntu@control 'kubectl rollout status deployment/calico-apiserver -n calico-apiserver --timeout=180s'
 	$(SSH) ubuntu@control 'kubectl get nodes'
 
 cilium: uninstall
@@ -272,6 +286,10 @@ clean-vms:
 	sudo rm -f $(LIBVIRT_DIR)/control-seed.iso
 	sudo rm -f $(LIBVIRT_DIR)/worker1-seed.iso
 	sudo rm -f $(LIBVIRT_DIR)/worker2-seed.iso
+	@echo ">>> Removing stale SSH host keys (VMs will get new keys on next boot)..."
+	@for h in control worker1 worker2 192.168.100.11 192.168.100.12 192.168.100.13; do \
+	  ssh-keygen -f "$$HOME/.ssh/known_hosts" -R "$$h" >/dev/null 2>&1 || true; \
+	done
 
 clean-nets:
 	-virsh net-destroy  k8s 2>/dev/null
