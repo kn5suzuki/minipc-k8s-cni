@@ -28,7 +28,10 @@ Flannel は最もシンプルな Kubernetes CNI プラグインです。
 
 ## 1.1 Flannel のインストール
 
-**前提**: [00-setup.md](00-setup.md) でクラスタが構築済みで、全 Node が `NotReady` であること。
+**前提**: [00-setup.md](00-setup.md) でクラスタが構築済みで、全 Node が `NotReady` であること
+(CNI 未導入の状態)。すでに Calico や Cilium を試した後であれば、その章の
+アンインストール手順 (または ホストで `make uninstall`) を先に実行してから
+始めてください。
 
 ```bash
 # control または ホストで実行
@@ -341,7 +344,7 @@ kubectl get configmap -n kube-flannel kube-flannel-cfg -o yaml
 
 ---
 
-## 1.10 Flannel のアンインストール (次の CNI に進む場合)
+## 1.10 Flannel のアンインストール (CNI 未導入の状態に戻す)
 
 ```bash
 # 1. テスト用リソースを削除 (Flannel の IP を持ったまま残さない)
@@ -361,9 +364,8 @@ for node in control worker1 worker2; do
 done
 
 # 5. CoreDNS Pod を削除 (必ず手順 3・4 の後に行う)
-#    → CNI が存在しない状態になるので Pending のまま待機し、
-#      02 章で Calico 導入後に自動で新しい IP を取得する (削除は1回で済む)
-#    ここを忘れると Flannel 時代の古い IP が残り、Calico 導入後に CrashLoopBackOff する
+#    → CNI が存在しない状態になるので Pending のまま待機する
+#    ここを忘れると Flannel 時代の古い IP が残り、次に別の CNI を入れたときに CrashLoopBackOff する
 kubectl delete pod -n kube-system -l k8s-app=kube-dns
 ```
 
@@ -380,4 +382,6 @@ Node が NotReady に戻ることを確認:
 kubectl get nodes
 ```
 
-[02-calico.md](02-calico.md) に進みます。
+クラスタは [00-setup.md](00-setup.md) 完了直後と同じ CNI 未導入の状態に戻りました。
+続けて [02-calico.md](02-calico.md) や [03-cilium.md](03-cilium.md) を、
+好きな順番で進められます。

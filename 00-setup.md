@@ -406,4 +406,6 @@ kubectl get nodes -o wide
 これで Kubernetes の骨格が出来ました。次は CNI プラグインを入れます。
 
 - CNI を入れると Node が **Ready** になり、CoreDNS Pod が **Running** になります。
-- **[01-flannel.md](01-flannel.md)** から始めましょう。
+- [01-flannel.md](01-flannel.md)・[02-calico.md](02-calico.md)・[03-cilium.md](03-cilium.md)
+  はそれぞれ独立しているので、どれから始めても構いません。まずは
+  **[01-flannel.md](01-flannel.md)** から順に読むのがおすすめです。
